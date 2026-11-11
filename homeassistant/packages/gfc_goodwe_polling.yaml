@@ -1,0 +1,33 @@
+###############################################################################
+# Grid-friendly charging (GFC) – reduced GoodWe polling
+#
+# The inverter's UDP interface (port 8899) does not tolerate parallel
+# sessions. The GoodWe integration polls through the same interface (by
+# default every few seconds). Two steps are required:
+#
+#   1. In the UI: Settings → Devices & services → GoodWe → ⋮ → System options
+#      → disable "Enable polling for changes" (pref_disable_polling).
+#   2. This automation refreshes the integration every 2 minutes instead.
+#
+# Result: one exchange every even minute, a few seconds long. charge_control.py
+# avoids exactly that window (even minute, seconds 0–17). Every timing rule in
+# this project assumes this 2-minute grid – do not change it without
+# re-checking sampling_size in gfc_logic.yaml and the window in
+# charge_control.py.
+#
+# One entity is enough: update_entity on any entity of the integration
+# refreshes the whole data coordinator.
+###############################################################################
+
+automation:
+  - id: gfc_goodwe_polling
+    alias: "GFC GoodWe polling (every 2 min)"
+    triggers:
+      - trigger: time_pattern
+        minutes: /2
+    conditions: []
+    actions:
+      - action: homeassistant.update_entity
+        target:
+          entity_id: sensor.pv_power
+    mode: single

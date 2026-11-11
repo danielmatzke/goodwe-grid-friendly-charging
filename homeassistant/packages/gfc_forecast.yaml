@@ -1,0 +1,174 @@
+###############################################################################
+# Grid-friendly charging (GFC) – PV forecast
+#
+# Two sources:
+#   * Solcast rooftop site (hobbyist tier: 10 API calls per day, reset at
+#     00:00 UTC) – preferred, minute-accurate rest forecast.
+#   * Forecast.Solar integration (configured in the UI) – fallback, multiplied
+#     by input_number.pv_correction_factor.
+#
+# The only place in the chain that reads a forecast is
+# sensor.pv_remaining_corrected. Everything downstream (usable energy, stage)
+# is source-agnostic.
+#
+# SOURCE ENTITY – adapt if yours differs:
+#   sensor.energy_production_today_remaining   (Forecast.Solar, "Estimated
+#   energy production - remaining today"; a second Forecast.Solar instance
+#   gets a _2 suffix)
+###############################################################################
+
+rest:
+  # Fetches are NOT driven by scan_interval but by the automation
+  # "GFC Forecast: fetch Solcast" at 8 fixed times with a morning focus (that
+  # is where the throttling decisions are made). scan_interval is 7 days so
+  # the coordinator does not poll on its own. Every HA restart and every
+  # rest.reload costs one extra call -> 2 calls reserve.
+  #
+  # hours=48 always covers today and tomorrow and keeps the raw attribute
+  # below the recorder's 16 kB attribute limit (168 h ≈ 40 kB).
+  #
+  # /forecasts only returns FUTURE 30-min periods (mean kW per period ->
+  # kWh = sum × 0.5). A sum computed here is only valid at fetch time and
+  # would freeze until the next fetch – unusable for control, because around
+  # noon it would keep counting energy that has already been produced. The
+  # minute-accurate rest forecast is computed by
+  # sensor.solcast_remaining_today_live below.
+  - resource: !secret solcast_forecast_url
+    headers:
+      # Full header value ("Bearer <key>") in secrets.yaml
+      Authorization: !secret solcast_api_key
+    scan_interval: 604800
+    sensor:
+      # State = end of the first future period (≈ fetch time + at most 30 min);
+      # serves as freshness indicator. The attribute "forecasts" carries the
+      # raw periods for the live rest forecast.
+      - name: "Solcast Forecast Raw"
+        unique_id: solcast_forecast_raw
+        icon: mdi:database-clock-outline
+        value_template: >-
+          {{ value_json.forecasts[0].period_end
+             if value_json.forecasts is defined and value_json.forecasts | count > 0
+             else 'none' }}
+        json_attributes:
+          - forecasts
+
+      # Informational: tomorrow's total (handy to compare against reality).
+      - name: "Solcast Tomorrow"
+        unique_id: solcast_tomorrow
+        unit_of_measurement: "kWh"
+        state_class: measurement
+        icon: mdi:weather-sunny-alert
+        value_template: >-
+          {% set tomorrow = (utcnow() + timedelta(days=1)).strftime('%Y-%m-%d') %}
+          {{ (value_json.forecasts | selectattr('period_end', 'search', tomorrow)
+              | map(attribute='pv_estimate') | sum * 0.5) | round(2) }}
+
+template:
+  - sensor:
+
+      #── Solcast rest forecast, minute-accurate ────────────────────────────────
+      # entity_id: sensor.solcast_remaining_today_live
+      # Re-sums the raw periods every minute: only periods that have not ended
+      # yet and end today (local time); the running period pro rata.
+      # pv_estimate is the mean kW of a 30-min period -> kWh = kW × 0.5 h × share.
+      # Unavailable if the raw data is missing or older than 10 h (the longest
+      # planned gap between fetches is 20:30 -> 05:45 = 9 h 15 min; a failed
+      # fetch makes the REST sensor unavailable immediately anyway).
+      - name: "Solcast Remaining Today Live"
+        unique_id: solcast_remaining_today_live
+        unit_of_measurement: "kWh"
+        state_class: measurement
+        icon: mdi:weather-sunny-clock
+        availability: >-
+          {% set raw = states('sensor.solcast_forecast_raw') %}
+          {% set fc = state_attr('sensor.solcast_forecast_raw', 'forecasts') %}
+          {% set t0 = as_datetime(raw) if raw is match('\\d{4}-\\d\\d-\\d\\dT') else none %}
+          {{ fc is not none and fc is not string and fc is iterable
+             and fc | count > 0 and t0 is not none
+             and (now() - t0).total_seconds() < 10 * 3600 }}
+        state: >-
+          {% set fc = state_attr('sensor.solcast_forecast_raw', 'forecasts') %}
+          {% set fc = fc if (fc is not none and fc is iterable and fc is not string) else [] %}
+          {% set t_now = now() %}
+          {% set day_end = today_at('00:00') + timedelta(days=1) %}
+          {% set ns = namespace(e=0) %}
+          {% for p in fc %}
+            {% set pe_raw = p.period_end | default('') | string %}
+            {% if pe_raw is match('\\d{4}-\\d\\d-\\d\\dT') %}
+              {% set pe = as_datetime(pe_raw) %}
+              {% if pe > t_now and pe <= day_end %}
+                {% set ps = pe - timedelta(minutes=30) %}
+                {% set share = 1 if ps >= t_now else (pe - t_now).total_seconds() / 1800 %}
+                {% set ns.e = ns.e + (p.pv_estimate | float(0)) * 0.5 * share %}
+              {% endif %}
+            {% endif %}
+          {% endfor %}
+          {{ ns.e | round(2) }}
+
+      #── Corrected rest forecast (the forecast switch) ─────────────────────────
+      # entity_id: sensor.pv_remaining_corrected
+      # Switch on -> Solcast while fresh; otherwise (switch off OR Solcast
+      # failed/stale) Forecast.Solar × pv_correction_factor.
+      - name: "PV Remaining Corrected"
+        unique_id: pv_remaining_corrected
+        unit_of_measurement: "kWh"
+        state_class: measurement
+        icon: mdi:solar-power-variant
+        availability: >-
+          {{ (is_state('input_boolean.gfc_use_solcast', 'on')
+              and has_value('sensor.solcast_remaining_today_live'))
+             or has_value('sensor.energy_production_today_remaining') }}
+        state: >-
+          {% if is_state('input_boolean.gfc_use_solcast', 'on')
+                and has_value('sensor.solcast_remaining_today_live') %}
+            {{ states('sensor.solcast_remaining_today_live') | float(0) | round(2) }}
+          {% else %}
+            {% set raw = states('sensor.energy_production_today_remaining') | float(0) %}
+            {% set factor = states('input_number.pv_correction_factor') | float(1.0) %}
+            {{ (raw * factor) | round(2) }}
+          {% endif %}
+
+      #── Active forecast source (observability) ────────────────────────────────
+      # entity_id: sensor.pv_forecast_source
+      # solcast | forecast_solar | forecast_solar_fallback (switch on, but
+      # Solcast failed/stale) | none. A state rather than an attribute, so the
+      # history (minimal_response) shows the fallback periods.
+      - name: "PV Forecast Source"
+        unique_id: pv_forecast_source
+        icon: mdi:source-branch
+        state: >-
+          {% set sc = is_state('input_boolean.gfc_use_solcast', 'on') %}
+          {% if sc and has_value('sensor.solcast_remaining_today_live') %}
+            solcast
+          {% elif has_value('sensor.energy_production_today_remaining') %}
+            {{ 'forecast_solar_fallback' if sc else 'forecast_solar' }}
+          {% else %}
+            none
+          {% endif %}
+
+automation:
+  - id: gfc_fetch_solcast
+    alias: "GFC Forecast: fetch Solcast"
+    description: >-
+      Fetches the Solcast forecast at fixed times instead of polling. Quota is
+      10 calls per day (reset 00:00 UTC): 8 planned calls plus 2 reserve for
+      restarts/reloads. Morning focus, because that is where the throttling
+      decisions are made. 11:15 instead of 11:00, so a forecast jump does not
+      land on the hard 11:00 edge of the headroom rule.
+    triggers:
+      - trigger: time
+        at:
+          - "05:45:00"
+          - "07:15:00"
+          - "08:30:00"
+          - "09:45:00"
+          - "11:15:00"
+          - "12:45:00"
+          - "14:30:00"
+          - "20:30:00"
+    conditions: []
+    actions:
+      - action: homeassistant.update_entity
+        target:
+          entity_id: sensor.solcast_forecast_raw
+    mode: single

@@ -1,0 +1,88 @@
+###############################################################################
+# Grid-friendly charging (GFC) – tunable parameters and switches
+#
+# Deliberately WITHOUT `initial:`. An initial value would reset every helper
+# on each Home Assistant restart/reload (RestoreState is skipped), so tuned
+# values would be lost. Set the start values ONCE after the first deployment
+# with input_number.set_value; they survive restarts afterwards.
+# WARNING: without that step every helper starts at its `min` value.
+#
+# Start values (set once after the first deployment):
+#   battery_usable_kwh          usable battery capacity, e.g. 7.68 for a BYD HVS 7.7
+#   battery_nominal_voltage_v   typical battery voltage while charging, e.g. 327
+#                               (read sensor.battery_voltage around 50 % SOC)
+#   pv_correction_factor        1.30 on the reference system. Only used when the
+#                               Forecast.Solar fallback is active. Corrects the
+#                               systematic under-forecast of the intraday rest
+#                               forecast. It fixes the BIAS, not the scatter.
+#   min_reserve_soc             20  (5 points above the inverter discharge floor;
+#                               the morning hold rule uses reserve + 7)
+#   dark_day_surplus_w          2500 (dark day: rolling 3 h surplus maximum below
+#                               this threshold → charge without limit)
+###############################################################################
+
+input_number:
+  battery_usable_kwh:
+    name: "Battery Usable kWh"
+    min: 1.0
+    max: 40.0
+    step: 0.01
+    mode: box
+    icon: mdi:battery-high
+    unit_of_measurement: "kWh"
+
+  battery_nominal_voltage_v:
+    name: "Battery Nominal Voltage V"
+    min: 40
+    max: 1000
+    step: 1
+    mode: box
+    icon: mdi:flash-triangle-outline
+    unit_of_measurement: "V"
+
+  pv_correction_factor:
+    name: "PV Correction Factor"
+    min: 0.5
+    max: 4.0
+    step: 0.05
+    mode: slider
+    icon: mdi:chart-bell-curve-cumulative
+    unit_of_measurement: "×"
+
+  min_reserve_soc:
+    name: "Min Reserve SOC"
+    min: 5
+    max: 50
+    step: 1
+    mode: slider
+    icon: mdi:battery-alert-variant-outline
+    unit_of_measurement: "%"
+
+  dark_day_surplus_w:
+    name: "Dark Day Surplus W"
+    min: 1000
+    max: 4000
+    step: 100
+    mode: slider
+    icon: mdi:weather-cloudy
+    unit_of_measurement: "W"
+
+input_boolean:
+  # Emergency stop flag. Set by the safeguard automation (grid import while
+  # charging) or manually from the dashboard. When on, the target stage is
+  # forced to 0 A. It is ONLY cleared manually through
+  # script.gfc_release_charging_25a — no automatic healing, because every
+  # automatic reset can heal the wrong way.
+  gfc_emergency_stop:
+    name: "GFC Emergency Stop"
+    icon: mdi:alert-octagon
+
+  # Forecast source for the control chain.
+  # on  = Solcast (minute-accurate rest forecast from the raw periods)
+  # off = Forecast.Solar × input_number.pv_correction_factor
+  # Even when on, the chain falls back to Forecast.Solar automatically if
+  # Solcast is unavailable or its data is older than 10 h. Which source is
+  # actually in use is shown by sensor.pv_forecast_source.
+  gfc_use_solcast:
+    name: "GFC Use Solcast"
+    icon: mdi:weather-sunny-alert

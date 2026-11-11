@@ -1,0 +1,332 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Grid-friendly vs. Greedy</title>
+<style>
+:root{
+  --bg:#f7f8f6; --card:#ffffff; --line:#e3e7e4; --grid:#eceeec;
+  --ink:#1a1d1c; --ink-2:#5c635f; --ink-3:#8b938e;
+  --actual:#1baf7a; --greedy:#eb6834; --limit:#7a8590;
+  --chip:#eef1ef; --chip-active:#1a1d1c; --chip-active-text:#f7f8f6;
+  --tooltip:#1a1d1c; --tooltip-text:#f2f4f2;
+}
+@media (prefers-color-scheme: dark){
+  :root:not([data-theme="light"]){
+    --bg:#16181a; --card:#1d2023; --line:#2a2e31; --grid:#24282b;
+    --ink:#e8ebe9; --ink-2:#9aa39d; --ink-3:#6c746f;
+    --actual:#199e70; --greedy:#d95926; --limit:#8d98a3;
+    --chip:#24282b; --chip-active:#e8ebe9; --chip-active-text:#16181a;
+    --tooltip:#e8ebe9; --tooltip-text:#1a1d1c;
+  }
+}
+:root[data-theme="dark"]{
+  --bg:#16181a; --card:#1d2023; --line:#2a2e31; --grid:#24282b;
+  --ink:#e8ebe9; --ink-2:#9aa39d; --ink-3:#6c746f;
+  --actual:#199e70; --greedy:#d95926; --limit:#8d98a3;
+  --chip:#24282b; --chip-active:#e8ebe9; --chip-active-text:#16181a;
+  --tooltip:#e8ebe9; --tooltip-text:#1a1d1c;
+}
+body{background:var(--bg); color:var(--ink);
+  font-family:-apple-system,"Segoe UI",Roboto,sans-serif;
+  margin:0; padding:20px 16px 40px;}
+.mono{font-family:ui-monospace,Menlo,Consolas,monospace; font-variant-numeric:tabular-nums;}
+.head{max-width:1060px; margin:0 auto 14px;}
+h1{font-size:1.35rem; font-weight:600; letter-spacing:-.01em; margin:0 0 2px; text-wrap:balance;}
+.sub{color:var(--ink-2); font-size:.86rem; margin:0;}
+.main{max-width:1060px; margin:0 auto; display:flex; flex-direction:column; gap:14px;}
+.days{display:flex; gap:8px; flex-wrap:wrap;}
+.day-chip{border:none; cursor:pointer; border-radius:999px; padding:6px 14px;
+  background:var(--chip); color:var(--ink); font-size:.82rem; font-family:inherit;}
+.day-chip[aria-pressed="true"]{background:var(--chip-active); color:var(--chip-active-text); font-weight:600;}
+.day-chip:focus-visible{outline:2px solid var(--actual); outline-offset:2px;}
+.kpis{display:grid; grid-template-columns:repeat(auto-fit,minmax(200px,1fr)); gap:10px;}
+.kpi{background:var(--card); border:1px solid var(--line); border-radius:10px; padding:12px 14px;}
+.kpi .label{font-size:.7rem; text-transform:uppercase; letter-spacing:.07em; color:var(--ink-2); margin-bottom:6px;}
+.kpi .pair{display:flex; gap:16px; align-items:baseline;}
+.kpi .value{font-size:1.25rem; font-weight:600;}
+.kpi .who{display:block; font-size:.68rem; color:var(--ink-3); margin-top:1px;}
+.kpi .solo{font-size:1.25rem; font-weight:600;}
+.dot{display:inline-block; width:9px; height:9px; border-radius:2px; margin-right:5px; vertical-align:baseline;}
+.dot.actual{background:var(--actual);} .dot.greedy{background:var(--greedy);}
+.panel{background:var(--card); border:1px solid var(--line); border-radius:10px; padding:14px 16px 8px;}
+.panel h2{font-size:.85rem; font-weight:600; margin:0 0 2px;}
+.panel .desc{font-size:.74rem; color:var(--ink-2); margin:0 0 8px;}
+.legend{display:flex; gap:14px; flex-wrap:wrap; font-size:.74rem; color:var(--ink-2); margin:4px 0 2px;}
+.legend .stroke{display:inline-block; width:18px; height:0; border-top:2.4px solid var(--actual); vertical-align:middle; margin-right:5px;}
+.legend .stroke.dashed{border-top-style:dashed; border-top-color:var(--greedy);}
+.legend .stroke.limitline{border-top:2px solid var(--limit);}
+svg{display:block; width:100%; height:auto;}
+.tooltip{position:fixed; pointer-events:none; background:var(--tooltip); color:var(--tooltip-text);
+  border-radius:7px; padding:7px 10px; font-size:.74rem; line-height:1.5; opacity:0; z-index:10;
+  transition:opacity .08s; max-width:230px;}
+.footnote{max-width:1060px; margin:6px auto 0; color:var(--ink-2); font-size:.78rem;}
+.footnote summary{cursor:pointer; font-weight:600;}
+.footnote p{margin:.5em 0; max-width:68ch;}
+@media (prefers-reduced-motion: reduce){ .tooltip{transition:none;} }
+</style>
+</head>
+<body>
+<header class="head">
+  <h1>Grid-friendly vs. Greedy</h1>
+  <p class="sub">Measured operation with trajectory control (actual) against a simulated greedy world without a charge limit — one entry per day since the control was armed.</p>
+</header>
+
+<div class="main">
+  <nav class="days" id="days" aria-label="Choose day"></nav>
+  <section class="kpis" id="kpis"></section>
+
+  <section class="panel">
+    <h2>Battery charging power</h2>
+    <p class="desc">Charging positive, discharging negative. The grey staircase below is the current limit actually written to the inverter.</p>
+    <div class="legend"><span><span class="stroke"></span>Actual (controlled)</span><span><span class="stroke dashed"></span>Greedy (simulated)</span><span><span class="stroke limitline"></span>Inverter limit</span></div>
+    <div id="chart-charge"></div>
+    <div id="track-limit"></div>
+  </section>
+
+  <section class="panel">
+    <h2>State of charge</h2>
+    <p class="desc">SOC in percent.</p>
+    <div class="legend"><span><span class="stroke"></span>Actual</span><span><span class="stroke dashed"></span>Greedy</span></div>
+    <div id="chart-soc"></div>
+  </section>
+
+  <section class="panel">
+    <h2>Grid exchange</h2>
+    <p class="desc">Export positive, import negative. This is where grid-friendliness shows: the greedy world is full earlier and pushes the whole PV peak into the grid at midday.</p>
+    <div class="legend"><span><span class="stroke"></span>Actual</span><span><span class="stroke dashed"></span>Greedy</span></div>
+    <div id="chart-grid"></div>
+  </section>
+</div>
+
+<details class="footnote">
+  <summary>Model &amp; method</summary>
+  <p>The greedy simulation uses the measured PV generation and house load of the day (both independent of the control) and charges without limit: efficiency 0.96, charge cap 5.5 kW, BMS taper from 94 % SOC (linear down to 150 W at 97 %). Discharging: SOC drain = load / η + standby, down to the discharge floor. The discharge parameters are an empirical fit on the reference system (see dashboard/README.md for re-calibration).</p>
+  <p><strong>Export 11:00–15:00</strong> is the core metric: in this window the grid carries the most PV. The less is exported there, the more of the midday peak the battery absorbed — the greedy world is long full by then and pushes everything into the grid.</p>
+  <p><strong>Contribution to the neighbourhood peak</strong> assumes that neighbouring systems charge greedily and share our weather — then the greedy curve also describes their export profile. Shown is our deviation at the moment of their maximum. It is usually negative because our profile is anti-correlated with a greedily charging neighbourhood: while their batteries absorb the surplus they export nothing and we export more; once they are full and dump everything into the grid, we hold back because we still have capacity. The statement holds against a <em>storing</em> neighbourhood; against systems without storage it would be weaker.</p>
+  <p><strong>Forecast source</strong> shows which rest forecast drove the control that day. Solcast (minute-accurate from the 30-minute raw periods) with automatic fallback to Forecast.Solar × correction factor when Solcast fails or its data is older than ten hours.</p>
+  <p><strong>Ø all days</strong> averages every curve time slot by time slot over all completed days, outage days excluded; the inverter limit then is an average too (share of throttled days at that time). The KPIs are means of the daily values — the Ø export peak is the mean of the daily peaks, not the peak of the averaged curve, which is much lower due to smoothing.</p>
+  <p>Both worlds are identical by definition until the first real throttling takes effect (inverter limit &lt; 25 A with surplus); the simulation re-couples to the measurements once the SOC difference is ≤ 1 point and the limit is open. The written inverter limit comes from the read-back-verified write log, not from the target sensor.</p>
+</details>
+
+<div class="tooltip" id="tooltip"></div>
+
+<script>
+const DATA = __DATA__;
+const STEP_MIN = 2;
+const colors = () => {
+  const s = getComputedStyle(document.documentElement);
+  return { actual: s.getPropertyValue('--actual').trim(), greedy: s.getPropertyValue('--greedy').trim(),
+           grid: s.getPropertyValue('--grid').trim(), ink2: s.getPropertyValue('--ink-2').trim(),
+           ink3: s.getPropertyValue('--ink-3').trim(), limit: s.getPropertyValue('--limit').trim() };
+};
+const W = 1010, H = 240, M = {l:52, r:14, t:10, b:22};
+const days = Object.keys(DATA).sort();
+let activeDay = days[days.length-1];
+
+// ── Average day ──────────────────────────────────────────────────────────────
+// Mean per 2-min slot over all completed days without outage. Missing values
+// (e.g. a truncated day) are not counted.
+const MEAN = 'mean';
+const baseDays = days.filter(d => DATA[d].complete && !DATA[d].gap);
+function meanSeries(key){
+  return Array.from({length:720}, (_,k) => {
+    let s=0, n=0;
+    baseDays.forEach(d => { const v=DATA[d][key][k]; if(v!=null){ s+=v; n++; } });
+    return n ? s/n : null;
+  });
+}
+function meanOf(values){ const w=values.filter(v=>v!=null); return w.length ? w.reduce((a,b)=>a+b,0)/w.length : null; }
+function minutes(hhmm){ if(!hhmm || !/^\d\d:\d\d$/.test(hhmm)) return null; const [h,m]=hhmm.split(':').map(Number); return h*60+m; }
+function hhmm(min){ if(min==null) return '–'; const m=Math.round(min); return String(Math.floor(m/60)).padStart(2,'0')+':'+String(m%60).padStart(2,'0'); }
+const MEANDAY = (() => {
+  const t = {};
+  ['soc','batt','meter','limit','sim_soc','sim_batt','sim_meter'].forEach(k => t[k]=meanSeries(k));
+  const kp = d => DATA[d].kpi;
+  const fullA = baseDays.map(d=>minutes(kp(d).full_actual)), fullS = baseDays.map(d=>minutes(kp(d).full_sim));
+  const nb = baseDays.map(d=>kp(d).neighbourhood && kp(d).neighbourhood.delta).filter(v=>v!=null);
+  t.kpi = {
+    midday_actual: meanOf(baseDays.map(d=>kp(d).midday_actual)),
+    midday_sim: meanOf(baseDays.map(d=>kp(d).midday_sim)),
+    total: baseDays.reduce((a,d)=>a+(kp(d).midday_actual||0)-(kp(d).midday_sim||0),0),
+    full_actual: hhmm(meanOf(fullA)), full_sim: hhmm(meanOf(fullS)),
+    full_n_actual: fullA.filter(v=>v!=null).length, full_n_sim: fullS.filter(v=>v!=null).length,
+    peak_actual: meanOf(baseDays.map(d=>kp(d).peak_actual)), peak_sim: meanOf(baseDays.map(d=>kp(d).peak_sim)),
+    neighbourhood: meanOf(nb), neighbourhood_n: nb.length,
+    writes: meanOf(baseDays.map(d=>kp(d).writes)),
+    solcast_days: baseDays.filter(d=>DATA[d].source && DATA[d].source.main==='solcast').length,
+  };
+  return t;
+})();
+const period = () => baseDays.length ? `${fmtDate(baseDays[0])}–${fmtDate(baseDays[baseDays.length-1])}` : '';
+
+function fmtTime(k){ const m=k*STEP_MIN; return String(Math.floor(m/60)).padStart(2,'0')+':'+String(m%60).padStart(2,'0'); }
+function fmtW(v){ return v==null ? '–' : (Math.abs(v)>=1000 ? (v/1000).toFixed(2)+' kW' : Math.round(v)+' W'); }
+function fmtDate(iso){ const [y,m,d]=iso.split('-'); return `${m}-${d}`; }
+
+function path(series, x, y){
+  let d='', open=false;
+  series.forEach((v,k)=>{
+    if(v==null){ open=false; return; }
+    d += (open?'L':'M')+x(k).toFixed(1)+' '+y(v).toFixed(1); open=true;
+  });
+  return d;
+}
+
+function yTicks(min,max,n){
+  const raw=(max-min)/n, mag=Math.pow(10,Math.floor(Math.log10(raw)));
+  const step=[1,2,2.5,5,10].map(f=>f*mag).find(s=>(max-min)/s<=n)||10*mag;
+  const t=[]; for(let v=Math.ceil(min/step)*step; v<=max+1e-9; v+=step) t.push(v);
+  return t;
+}
+
+function draw(containerId, series, opts){
+  const f=colors(), el=document.getElementById(containerId);
+  const all=series.flatMap(r=>r.data).filter(v=>v!=null);
+  let lo=Math.min(...all,opts.minY??Infinity), hi=Math.max(...all,opts.maxY??-Infinity);
+  if(opts.zeroLine){ lo=Math.min(lo,0); hi=Math.max(hi,0); }
+  const span=(hi-lo)||1; lo-=span*.06; hi+=span*.06;
+  const x=k=>M.l+(k*STEP_MIN/1440)*(W-M.l-M.r), y=v=>M.t+(1-(v-lo)/(hi-lo))*(H-M.t-M.b);
+  let s=`<svg viewBox="0 0 ${W} ${H}" role="img" aria-label="${opts.aria}">`;
+  yTicks(lo,hi,5).forEach(v=>{ s+=`<line x1="${M.l}" x2="${W-M.r}" y1="${y(v)}" y2="${y(v)}" stroke="${f.grid}" stroke-width="1"/>`
+    +`<text x="${M.l-7}" y="${y(v)+3.5}" text-anchor="end" font-size="10.5" fill="${f.ink2}" class="mono">${opts.fmtY(v)}</text>`; });
+  for(let h=0; h<=24; h+=3){ const px=M.l+(h/24)*(W-M.l-M.r);
+    s+=`<text x="${px}" y="${H-6}" text-anchor="middle" font-size="10.5" fill="${f.ink3}" class="mono">${h}h</text>`; }
+  if(opts.zeroLine) s+=`<line x1="${M.l}" x2="${W-M.r}" y1="${y(0)}" y2="${y(0)}" stroke="${f.ink3}" stroke-width="1.2"/>`;
+  series.forEach(r=>{ s+=`<path d="${path(r.data,x,y)}" fill="none" stroke="${r.color==='actual'?f.actual:f.greedy}"
+      stroke-width="2.2" ${r.dashed?'stroke-dasharray="7 5"':''} stroke-linejoin="round" stroke-linecap="round"/>`; });
+  series.forEach(r=>{ for(let k=r.data.length-1;k>=0;k--){ if(r.data[k]!=null){
+      s+=`<text x="${Math.min(x(k)+5,W-4)}" y="${y(r.data[k])+3}" font-size="10" font-weight="600" fill="${r.color==='actual'?f.actual:f.greedy}">${r.label}</text>`; break; } } });
+  s+=`<line id="${containerId}-cross" y1="${M.t}" y2="${H-M.b}" stroke="${f.ink3}" stroke-width="1" opacity="0"/>`;
+  s+=`<rect x="${M.l}" y="${M.t}" width="${W-M.l-M.r}" height="${H-M.t-M.b}" fill="transparent" data-hover="${containerId}"/>`;
+  s+='</svg>';
+  el.innerHTML=s;
+  el.querySelector('[data-hover]').addEventListener('mousemove', ev=>hover(ev,containerId,series,opts,x));
+  el.querySelector('[data-hover]').addEventListener('mouseleave', ()=>{ document.getElementById('tooltip').style.opacity=0;
+    document.getElementById(containerId+'-cross').setAttribute('opacity',0); });
+}
+
+function hover(ev, id, series, opts, x){
+  const svg=ev.target.ownerSVGElement, pt=svg.createSVGPoint();
+  pt.x=ev.clientX; pt.y=ev.clientY;
+  const p=pt.matrixTransform(svg.getScreenCTM().inverse());
+  const k=Math.max(0,Math.min(series[0].data.length-1,Math.round((p.x-M.l)/(W-M.l-M.r)*720)));
+  const cross=document.getElementById(id+'-cross');
+  cross.setAttribute('x1',x(k)); cross.setAttribute('x2',x(k)); cross.setAttribute('opacity',.6);
+  const tt=document.getElementById('tooltip');
+  let html=`<strong class="mono">${fmtTime(k)}</strong>`;
+  series.forEach(r=>{ html+=`<br><span class="dot ${r.color}"></span>${r.label}: <span class="mono">${opts.fmtY(r.data[k],true)}</span>`; });
+  if(opts.extra) html+=opts.extra(k);
+  tt.innerHTML=html;
+  tt.style.left=Math.min(ev.clientX+14,innerWidth-250)+'px';
+  tt.style.top=(ev.clientY+14)+'px'; tt.style.opacity=1;
+}
+
+function drawLimitTrack(day){
+  const f=colors(), el=document.getElementById('track-limit'), height=44;
+  const x=k=>M.l+(k*STEP_MIN/1440)*(W-M.l-M.r);
+  const yA=a=>8+(1-a/25)*(height-18);
+  let s=`<svg viewBox="0 0 ${W} ${height}" aria-label="Written inverter current limit">`;
+  let d='', prev=null;
+  day.limit.forEach((a,k)=>{ if(a==null) return;
+    if(prev==null) d+=`M${x(k).toFixed(1)} ${yA(a).toFixed(1)}`;
+    else if(a!==prev) d+=`L${x(k).toFixed(1)} ${yA(prev).toFixed(1)}L${x(k).toFixed(1)} ${yA(a).toFixed(1)}`;
+    prev=a; });
+  if(prev!=null) d+=`L${x(day.limit.length-1).toFixed(1)} ${yA(prev).toFixed(1)}`;
+  s+=`<path d="${d}" fill="none" stroke="${f.limit}" stroke-width="2"/>`;
+  [0,25].forEach(a=>{ s+=`<text x="${M.l-7}" y="${yA(a)+3.5}" text-anchor="end" font-size="9.5" fill="${f.ink3}" class="mono">${a} A</text>`; });
+  s+='</svg>';
+  el.innerHTML=s;
+}
+
+function pairTile(label, a, b, subA='Actual', subB='Greedy'){
+  return `<div class="kpi"><div class="label">${label}</div><div class="pair">
+    <span><span class="value mono"><span class="dot actual"></span>${a}</span><span class="who">${subA}</span></span>
+    <span><span class="value mono" style="opacity:.85"><span class="dot greedy"></span>${b}</span><span class="who">${subB}</span></span>
+  </div></div>`;
+}
+function soloTile(label, value, sub, color='inherit'){
+  return `<div class="kpi"><div class="label">${label}</div><span class="solo mono" style="color:${color}">${value}</span><span class="who">${sub}</span></div>`;
+}
+const kWh = v => v==null ? '–' : v.toFixed(1)+' kWh';
+const signed = (v,dec=1) => (v<0?'−':'+')+Math.abs(v).toFixed(dec);
+
+function meanKpis(k){
+  const n = baseDays.length;
+  return pairTile('Ø export 11:00–15:00', kWh(k.midday_actual), kWh(k.midday_sim), 'actual per day', 'greedy per day')
+    + soloTile('Total export 11:00–15:00', signed(k.total)+' kWh', `actual vs. greedy over ${n} days (${period()}) · negative = less midday export`, k.total<0?'var(--actual)':'var(--greedy)')
+    + pairTile('Ø battery full at', k.full_actual, k.full_sim, `full on ${k.full_n_actual} of ${n} days`, `full on ${k.full_n_sim} of ${n} days`)
+    + pairTile('Ø export peak', fmtW(k.peak_actual), fmtW(k.peak_sim), 'mean of daily peaks', 'mean of daily peaks')
+    + (k.neighbourhood==null ? soloTile('Ø contribution to neighbourhood peak','–','no data')
+       : soloTile('Ø contribution to neighbourhood peak', signed(k.neighbourhood,2)+' kW',
+           `over ${k.neighbourhood_n} days with relevant export · negative = we relieve the grid`, k.neighbourhood<0?'var(--actual)':'var(--greedy)'))
+    + soloTile('Forecast source', `${k.solcast_days} / ${n}`, 'days with Solcast as main source (rest Forecast.Solar)')
+    + soloTile('Ø inverter writes', k.writes==null?'–':k.writes.toFixed(1), 'per day · budget: warning 25 / stop 40');
+}
+
+function chips(){
+  document.getElementById('days').innerHTML=
+    `<button class="day-chip" aria-pressed="${activeDay===MEAN}" onclick="chooseDay('${MEAN}')" title="Mean over ${baseDays.length} completed days without outage">Ø all days</button>`
+    + days.map(d=>
+    `<button class="day-chip" aria-pressed="${d===activeDay}" onclick="chooseDay('${d}')">${fmtDate(d)}${DATA[d].gap?' ⚠':''}</button>`).join('');
+}
+
+function neighbourhoodTile(n){
+  if(!n || n.delta==null)
+    return soloTile('Contribution to neighbourhood peak', '–', 'no relevant export');
+  const color=n.delta<0?'var(--actual)':(n.delta>0?'var(--greedy)':'inherit');
+  return soloTile('Contribution to neighbourhood peak', signed(n.delta,2)+' kW',
+    `at ${n.time}, neighbourhood at ${n.peak.toFixed(2)} kW · negative = we relieve the grid`, color);
+}
+
+function sourceTile(q){
+  if(!q) return '';
+  const name={solcast:'Solcast', forecast_solar:'Forecast.Solar', forecast_solar_fallback:'Forecast.Solar (fallback)', none:'none'}[q.main]||q.main;
+  let sub='Controlling forecast 07:00–19:00';
+  if(q.solcast>0 && q.solcast<1) sub=`Solcast ${Math.round(q.solcast*100)} % of daylight time`;
+  if(q.fallback>0) sub+=` · fallback ${Math.round(q.fallback*100)} %`;
+  return soloTile('Forecast source', name, sub);
+}
+
+function render(){
+  const isMean = activeDay===MEAN;
+  const t=isMean ? MEANDAY : DATA[activeDay], k=t.kpi;
+  chips();
+  if(t.gap){
+    document.getElementById('kpis').innerHTML=
+      `<div class="kpi" style="grid-column:1/-1"><div class="label">Data outage</div>
+       <span class="solo">No recording on this day</span>
+       <span class="who">Home Assistant was offline. The inverter keeps running with the last written limit while HA is down.</span></div>`;
+    ['chart-charge','track-limit','chart-soc','chart-grid'].forEach(id=>document.getElementById(id).innerHTML='');
+    return;
+  }
+  document.getElementById('kpis').innerHTML= isMean ? meanKpis(k) :
+    pairTile('Export 11:00–15:00', kWh(k.midday_actual), kWh(k.midday_sim))
+    + pairTile('Battery full at', k.full_actual, k.full_sim)
+    + pairTile('Export peak', fmtW(k.peak_actual), fmtW(k.peak_sim))
+    + neighbourhoodTile(k.neighbourhood)
+    + sourceTile(t.source)
+    + soloTile('Inverter writes', k.writes, 'budget: warning 25 / stop 40');
+  const chgA=t.batt.map(v=>v==null?null:-v), chgS=t.sim_batt.map(v=>v==null?null:-v);
+  draw('chart-charge', [
+    {data:chgA, color:'actual', label:'Actual', dashed:false},
+    {data:chgS, color:'greedy', label:'Greedy', dashed:true}],
+    {fmtY:fmtW, zeroLine:true, aria:'Charging power actual and greedy',
+     extra:k2=>`<br>${isMean?'Ø ':''}Inverter limit: <span class="mono">${t.limit[k2]==null?'–':(isMean?t.limit[k2].toFixed(1):t.limit[k2])+' A'}</span>`});
+  drawLimitTrack(t);
+  draw('chart-soc', [
+    {data:t.soc, color:'actual', label:'Actual', dashed:false},
+    {data:t.sim_soc, color:'greedy', label:'Greedy', dashed:true}],
+    {fmtY:v=>v==null?'–':Math.round(v)+' %', minY:10, maxY:100, aria:'State of charge actual and greedy'});
+  draw('chart-grid', [
+    {data:t.meter, color:'actual', label:'Actual', dashed:false},
+    {data:t.sim_meter, color:'greedy', label:'Greedy', dashed:true}],
+    {fmtY:fmtW, zeroLine:true, aria:'Grid exchange actual and greedy'});
+}
+function chooseDay(d){ activeDay=d; render(); }
+render();
+matchMedia('(prefers-color-scheme: dark)').addEventListener('change', render);
+</script>
+</body>
+</html>

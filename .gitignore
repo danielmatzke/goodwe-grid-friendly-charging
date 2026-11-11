@@ -1,0 +1,23 @@
+# Never commit secrets, tokens or personal data
+secrets.yaml
+*.token
+*token*.txt
+.env
+.env.*
+
+# Local working data: baselines (contain the inverter serial), logs, dashboard output
+local/
+dashboard-data/
+*.jsonl
+baseline*.json
+
+# Python
+.venv/
+venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# Runtime files of charge_control.py
+.charge_control.lock
+charge_control_state.json

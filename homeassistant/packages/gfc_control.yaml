@@ -1,0 +1,276 @@
+###############################################################################
+# Grid-friendly charging (GFC) – the ONLY write path to the inverter
+#
+# Architecture (one write path, one master switch):
+#   * automation "GFC Control" is the master switch. Off = nobody writes.
+#     It is the only caller of charge_control.py.
+#   * automation "GFC Safeguard" never writes. It only sets
+#     input_boolean.gfc_emergency_stop; the target stage then becomes 0 A and
+#     the control automation writes it via the emergency path.
+#   * automation "GFC Reconcile" re-writes the current target every 2 h and on
+#     HA start. Thanks to write-only-on-change this costs zero writes in normal
+#     operation and heals any deviation (failed write, HA killed mid-write…).
+#   * script.gfc_release_charging_25a is the ONLY way to clear the emergency
+#     stop flag.
+#
+# BOOTSTRAP SAFETY: the control automation ships with `initial_state: false`,
+# so installing this package never writes to the inverter. Observe
+# sensor.battery_charge_target_a for a few days first (dry run). To ARM:
+# delete the `initial_state: false` line, reload automations, turn the
+# automation on, then run automation.trigger on "GFC Reconcile" once as the
+# initial sync (see AGENTS.md). Leaving `initial_state: false` in place while
+# armed is unsafe: after every restart the control would be off and the
+# inverter would stay frozen at the last stage, possibly 0 A.
+#
+# To DISARM: first run script.gfc_release_charging_25a (opens the limit to
+# 25 A = normal inverter behaviour), then turn the control automation off.
+###############################################################################
+
+shell_command:
+  # Sets battery_charge_current to an allowed stage (0/6/12/18/25 A). The
+  # script avoids the poll-collision window itself, writes only on change,
+  # reads back, and enforces a daily write budget.
+  gfc_set_charge_current: python3 /config/scripts/charge_control.py {{ ampere }}
+
+  # Emergency path: --emergency = no window wait, budget stop ignored
+  # (a safety write must never be refused).
+  gfc_set_charge_current_emergency: python3 /config/scripts/charge_control.py {{ ampere }} --emergency
+
+command_line:
+  # charge_control.py writes /config/charge_control_state.json after EVERY run.
+  # Without this sensor write failures would be invisible: shell_command does
+  # not raise on exit != 0, and the inverter exposes no sensor for the
+  # configured charge current.
+  - sensor:
+      name: "Charge Control Result"
+      unique_id: charge_control_result
+      command: "cat /config/charge_control_state.json 2>/dev/null || echo '{}'"
+      value_template: "{{ value_json.result | default('unknown') }}"
+      json_attributes:
+        - last_value
+        - target
+        - writes_today
+        - ts
+      scan_interval: 120
+
+script:
+  gfc_release_charging_25a:
+    alias: "GFC: release charging (25 A)"
+    icon: mdi:lock-open-variant
+    description: >-
+      Clears the emergency stop flag and opens the charge limit (25 A) via the
+      emergency path. Works always, also on budget stop or a held lock.
+    sequence:
+      - action: input_boolean.turn_off
+        target:
+          entity_id: input_boolean.gfc_emergency_stop
+      - action: shell_command.gfc_set_charge_current_emergency
+        data:
+          ampere: 25
+        continue_on_error: true
+      - action: homeassistant.update_entity
+        target:
+          entity_id: sensor.charge_control_result
+      - delay:
+          seconds: 3
+      - action: persistent_notification.create
+        data:
+          title: "GFC: charging released (25 A)"
+          message: >-
+            Emergency stop flag cleared, 25 A written via the emergency path.
+            Result: {{ states("sensor.charge_control_result") }}
+            (good: ok_written or ok_unchanged).
+            If the control is armed it returns to the regular stage within minutes.
+          notification_id: gfc_release
+    mode: single
+
+automation:
+  - id: gfc_control
+    alias: "GFC Control: write charge current stage"
+    # REMOVE THE NEXT LINE TO ARM (see header and AGENTS.md).
+    initial_state: false
+    description: >-
+      MASTER SWITCH. Off = nobody writes (the reconcile checks this state, the
+      safeguard never writes). Normal path: stable stage change (4 min) ->
+      charge_control.py (avoids the poll window, writes only on change, read
+      back, daily budget). Emergency path: emergency flag on -> 0 A
+      immediately via the emergency path (no window wait, ignores budget stop).
+      Flag on switches EVERY run into emergency mode and bypasses both other
+      conditions – target-sensor validity (the emergency path writes a
+      hard-coded 0) and the 10-min spacing (a late stage trigger must get
+      through if mode:single dropped the flag edge). The emergency_watch
+      trigger (flag on for 5 min) re-checks once – covers a lost edge AND a
+      failed first write; on success it only costs a read. The
+      emergency_watch_tick (minutes 3/23/43, only with flag on – otherwise
+      condition 0 blocks it) is the RESTART-PROOF watchdog: for:-timers and
+      edges die on reload/restart (the flag is restored as on without a new
+      edge), the tick does not. Odd minutes = outside the poll window.
+      Maximum grid-import gap therefore 20 min.
+    triggers:
+      - trigger: state
+        entity_id: sensor.battery_charge_target_a
+        for: "00:04:00"
+        id: stage
+      - trigger: state
+        entity_id: input_boolean.gfc_emergency_stop
+        to: "on"
+        id: emergency
+      - trigger: state
+        entity_id: input_boolean.gfc_emergency_stop
+        to: "on"
+        for: "00:05:00"
+        id: emergency_watch
+      - trigger: time_pattern
+        minutes: 3
+        id: emergency_watch_tick
+      - trigger: time_pattern
+        minutes: 23
+        id: emergency_watch_tick
+      - trigger: time_pattern
+        minutes: 43
+        id: emergency_watch_tick
+    conditions:
+      - condition: template
+        value_template: >-
+          {{ trigger.id != "emergency_watch_tick"
+             or is_state("input_boolean.gfc_emergency_stop", "on") }}
+      - condition: template
+        value_template: >-
+          {{ trigger.id in ["emergency", "emergency_watch", "emergency_watch_tick"]
+             or is_state("input_boolean.gfc_emergency_stop", "on")
+             or states("sensor.battery_charge_target_a") in ["0","6","12","18","25"] }}
+      - condition: template
+        value_template: >-
+          {{ trigger.id in ["emergency", "emergency_watch", "emergency_watch_tick"]
+             or is_state("input_boolean.gfc_emergency_stop", "on")
+             or this.attributes.last_triggered is none
+             or (now() - this.attributes.last_triggered).total_seconds() >= 600 }}
+    actions:
+      - variables:
+          emergency: >-
+            {{ trigger.id in ["emergency", "emergency_watch", "emergency_watch_tick"]
+               or is_state("input_boolean.gfc_emergency_stop", "on") }}
+          target: '{{ "0" if emergency else trigger.to_state.state }}'
+      - choose:
+          - conditions:
+              - condition: template
+                value_template: "{{ emergency }}"
+            sequence:
+              - action: shell_command.gfc_set_charge_current_emergency
+                data:
+                  ampere: 0
+                continue_on_error: true
+        default:
+          - action: shell_command.gfc_set_charge_current
+            data:
+              ampere: "{{ target }}"
+            continue_on_error: true
+      - action: homeassistant.update_entity
+        target:
+          entity_id: sensor.charge_control_result
+      - delay:
+          seconds: 3
+      - action: logbook.log
+        data:
+          name: GFC Control
+          message: >-
+            Write attempt {{ target }} A{{ " (EMERGENCY STOP, emergency path, trigger "
+            ~ trigger.id ~ ")" if emergency else "" }} — result:
+            {{ states("sensor.charge_control_result") }} (details: charge_control_log.jsonl)
+          entity_id: sensor.battery_charge_target_a
+    mode: single
+    trace:
+      stored_traces: 25
+
+  - id: gfc_safeguard
+    alias: "GFC Safeguard: grid import while charging"
+    description: >-
+      The safeguard does NOT write and switches NOTHING off – it only sets the
+      emergency stop flag. sensor.battery_charge_target_a then jumps to 0 and
+      the control automation executes the stop via its emergency path (if
+      armed). The 4-min persistence lives in the binary_sensor (delay_on), so
+      the 10-min backup trigger is fully qualified as well and avoids the
+      edge trap. Clearing the flag: ONLY manually via
+      script.gfc_release_charging_25a.
+    triggers:
+      - trigger: state
+        entity_id: binary_sensor.gfc_grid_import_while_charging
+        to: "on"
+        id: edge
+      - trigger: time_pattern
+        minutes: /10
+        id: backup
+    conditions:
+      - condition: state
+        entity_id: binary_sensor.gfc_grid_import_while_charging
+        state: "on"
+      - condition: state
+        entity_id: input_boolean.gfc_emergency_stop
+        state: "off"
+    actions:
+      - variables:
+          import_w: '{{ (states("sensor.meter_active_power_total") | float(0) * -1) | round(0) }}'
+          charge_w: '{{ (states("sensor.battery_power") | float(0) * -1) | round(0) }}'
+      - action: input_boolean.turn_on
+        target:
+          entity_id: input_boolean.gfc_emergency_stop
+      - action: logbook.log
+        data:
+          name: GFC SAFEGUARD
+          message: >-
+            TRIGGERED ({{ trigger.id }}): grid import {{ import_w }} W while charging
+            {{ charge_w }} W for ≥ 4 min. Emergency stop flag set → target stage 0 A.
+            Executed by the control automation (state
+            {{ states("automation.gfc_control_write_charge_current_stage") }}),
+            result: sensor.charge_control_result.
+          entity_id: binary_sensor.gfc_grid_import_while_charging
+      - action: persistent_notification.create
+        data:
+          title: "GFC: emergency stop triggered"
+          message: >-
+            Grid import {{ import_w }} W while charging {{ charge_w }} W for ≥ 4 min
+            ({{ now().strftime("%Y-%m-%d %H:%M") }}).
+
+
+            Emergency stop flag set: the target stage is now 0 A. The control
+            automation (state:
+            {{ states("automation.gfc_control_write_charge_current_stage") }})
+            writes it; the result is shown by sensor.charge_control_result
+            (expected: ok_written). The reconcile re-checks every 2 h.
+
+
+            Release after finding the cause: run the script
+            "GFC: release charging (25 A)" – writes 25 A and clears the flag.
+          notification_id: gfc_safeguard
+    mode: single
+
+  - id: gfc_reconcile
+    alias: "GFC Reconcile: target vs. inverter"
+    description: >-
+      ONE unconditional periodic sync, no branches. Writes the current target
+      stage every 2 h (minute 37 = odd minute, outside the poll window) and
+      after HA start. Thanks to write-only-on-change this normally costs zero
+      writes and heals ANY deviation, however it happened. Runs only while the
+      control is armed (master switch). It deliberately does NOT clear the
+      emergency stop flag.
+    triggers:
+      - trigger: time_pattern
+        hours: /2
+        minutes: 37
+        id: tick
+      - trigger: homeassistant
+        event: start
+        id: start
+    conditions:
+      - condition: state
+        entity_id: automation.gfc_control_write_charge_current_stage
+        state: "on"
+    actions:
+      - wait_template: '{{ states("sensor.battery_charge_target_a") in ["0","6","12","18","25"] }}'
+        timeout: "00:10:00"
+        continue_on_timeout: false
+      - action: shell_command.gfc_set_charge_current
+        data:
+          ampere: '{{ states("sensor.battery_charge_target_a") }}'
+        continue_on_error: true
+    mode: single

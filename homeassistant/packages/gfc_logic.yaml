@@ -1,0 +1,289 @@
+###############################################################################
+# Grid-friendly charging (GFC) – decision logic (read-only, never writes)
+#
+# Computes the target charge-current stage sensor.battery_charge_target_a
+# (0 / 6 / 12 / 18 / 25 A). Writing it to the inverter is the job of
+# gfc_control.yaml.
+#
+# SOURCE ENTITIES (GoodWe integration) – adapt if yours differ:
+#   sensor.battery_state_of_charge   battery SOC in %
+#   sensor.battery_power             W, NEGATIVE = charging, positive = discharging
+#   sensor.pv_power                  W, total PV power
+#   sensor.load                      W, house load MEASURED by the inverter
+#                                    (GoodWe "Load"). Do NOT use
+#                                    sensor.house_consumption: the goodwe library
+#                                    computes that from PV + battery power − grid
+#                                    and inherits the battery-power measurement
+#                                    error (≈110 W too low at night, ≈150 W too
+#                                    high at high PV on the reference system).
+#   sensor.meter_active_power_total  W at the grid meter, POSITIVE = export,
+#                                    negative = import
+#
+# Entity IDs: Home Assistant derives the entity_id from the slugified `name`
+# (not from unique_id). The names are English so the generated IDs match the
+# references in this package. Display names can be changed in the UI later
+# without breaking anything (the entity_id is kept thanks to unique_id).
+#
+# availability: every sensor becomes `unavailable` when its inputs are
+# unavailable/unknown, instead of producing plausible but wrong values from
+# float(0) defaults (e.g. SOC = 0 → permanently "charge").
+###############################################################################
+
+sensor:
+  # 7-day mean of the house load during DAYLIGHT (the source is unavailable at
+  # night). Basis for the expected remaining house consumption until sunset.
+  # A 24 h mean would underestimate the daytime load.
+  #
+  # sampling_size is tied to the 2-min GoodWe polling (~440 daylight samples
+  # per day, ~3100 per 7 days). If polling is ever made faster, sampling_size
+  # has to grow as well, otherwise the effective window shrinks below 7 days.
+  - platform: statistics
+    name: "House Consumption Daylight Mean 7d"
+    unique_id: house_consumption_daylight_mean_7d
+    entity_id: sensor.house_consumption_daylight
+    state_characteristic: mean
+    sampling_size: 6000
+    max_age:
+      days: 7
+    precision: 0
+
+  # Rolling 3 h maximum of the PV surplus (dark-day detection).
+  # ~90 samples per 3 h at 2-min polling; sampling_size with reserve.
+  - platform: statistics
+    name: "PV Surplus Max 3h"
+    unique_id: pv_surplus_max_3h
+    entity_id: sensor.pv_surplus
+    state_characteristic: value_max
+    sampling_size: 500
+    max_age:
+      hours: 3
+    precision: 0
+
+template:
+  - sensor:
+
+      #── House load during daylight only (source of the 7-day mean) ───────────
+      # entity_id: sensor.house_consumption_daylight
+      # Unavailable at night -> the statistics platform only averages daylight
+      # samples.
+      - name: "House Consumption Daylight"
+        unique_id: house_consumption_daylight
+        unit_of_measurement: "W"
+        state_class: measurement
+        icon: mdi:home-lightning-bolt-outline
+        availability: >-
+          {{ is_state('sun.sun', 'above_horizon')
+             and has_value('sensor.load') }}
+        state: >-
+          {{ states('sensor.load') | float(0) | round(0) }}
+
+      #── Usable rest forecast (net of the expected remaining house load) ──────
+      # entity_id: sensor.pv_remaining_usable
+      # E_usable = max(0, E_rest_corrected − mean daylight load (7 d) × hours
+      # until sunset). Window: now → sunset (daytime) or sunrise → sunset
+      # (night, next_rising < next_setting). After sunset next_setting points to
+      # tomorrow – E_rest_corrected is ~0 then and the result stays 0.
+      # Without subtracting the house load the battery missed full charge on
+      # days with a large daytime consumption.
+      - name: "PV Remaining Usable"
+        unique_id: pv_remaining_usable
+        unit_of_measurement: "kWh"
+        state_class: measurement
+        icon: mdi:solar-power-variant-outline
+        # The 7-day mean is deliberately NOT part of availability: the
+        # statistics platform mirrors the unavailability of its source, i.e.
+        # the mean is unavailable EVERY night (and empty on first start) – the
+        # whole chain would otherwise cascade to unavailable each night. Until
+        # a value exists the default of 400 W applies (harmless at night:
+        # without PV nothing can charge; from sunrise the sample buffer
+        # delivers the real mean immediately).
+        availability: >-
+          {{ has_value('sensor.pv_remaining_corrected')
+             and state_attr('sun.sun', 'next_setting') is not none
+             and state_attr('sun.sun', 'next_rising') is not none }}
+        state: >-
+          {% set e_rest = states('sensor.pv_remaining_corrected') | float(0) %}
+          {% set mean_w = states('sensor.house_consumption_daylight_mean_7d') | float(400) %}
+          {% set r = as_datetime(state_attr('sun.sun', 'next_rising')) %}
+          {% set s = as_datetime(state_attr('sun.sun', 'next_setting')) %}
+          {% set hrs = ((s - r) if r < s else (s - now())).total_seconds() / 3600 %}
+          {% set hrs = [hrs, 0] | max %}
+          {{ [e_rest - mean_w / 1000 * hrs, 0] | max | round(2) }}
+
+      #── PV surplus (source of the rolling 3 h maximum) ────────────────────────
+      # entity_id: sensor.pv_surplus
+      - name: "PV Surplus"
+        unique_id: pv_surplus
+        unit_of_measurement: "W"
+        state_class: measurement
+        icon: mdi:transmission-tower-export
+        availability: >-
+          {{ has_value('sensor.pv_power') and has_value('sensor.load') }}
+        state: >-
+          {{ (states('sensor.pv_power') | float(0) - states('sensor.load') | float(0)) | round(0) }}
+
+      #── Missing kWh until 100 % ───────────────────────────────────────────────
+      # entity_id: sensor.battery_missing_kwh
+      - name: "Battery Missing kWh"
+        unique_id: battery_missing_kwh
+        unit_of_measurement: "kWh"
+        state_class: measurement
+        icon: mdi:battery-minus-variant
+        availability: >-
+          {{ has_value('sensor.battery_state_of_charge')
+             and has_value('input_number.battery_usable_kwh') }}
+        state: >-
+          {% set soc = states('sensor.battery_state_of_charge') | float(0) %}
+          {% set cap = states('input_number.battery_usable_kwh') | float(0) %}
+          {{ ((100 - soc) / 100 * cap) | round(2) }}
+
+      #── Target charge-current stage (trajectory logic) ────────────────────────
+      # entity_id: sensor.battery_charge_target_a
+      # Core idea: the current limit is a CAP, not a setpoint. When clouds make
+      # the surplus flutter, the charging power follows the surplus on its own –
+      # without any write. A new stage is only needed when the SOC that still
+      # has to be filled runs out of the forecast band. On the reference system
+      # this needs ~3 writes per day (binary on/off control needed up to 18 on
+      # cloudy days), the battery is full in the afternoon instead of before
+      # noon, and the midday peak is absorbed.
+      #
+      # Stages: 0 / 6 / 12 / 18 / 25 A. Stage power = A × battery_nominal_voltage_v
+      # (at 327 V ≈ 0 / 2.0 / 3.9 / 5.9 kW / open).
+      #
+      # Rule order (first match wins):
+      #   1. emergency stop flag on                                 → 0
+      #   2. night (sun below horizon)                              → 25
+      #   3. SOC below reserve, reserve mode, dark day, or the
+      #      forecast barely covers what is missing (usable ≤ missing × 1.3)
+      #                                                             → 25
+      #   4. almost full: missing ≤ 0.35 kWh (leave only above 0.55; dead band
+      #      against the BMS float sag around 100 %)                → 25
+      #   5. morning hold: before 11:00, keep 25 A while SOC < reserve + 7
+      #      (breaks the morning loop headroom 0 A → discharge below reserve
+      #      → 25 A → 2 points hysteresis → 0 A again; never switches TO 25 A)
+      #                                                             → 25
+      #   6. headroom: before 11:00 and usable ≥ missing × 3.0
+      #      (leave only below × 2.4; dead band against the forecast saw-tooth)
+      #                                                             → 0
+      #   7. trajectory: smallest stage whose power covers
+      #      missing / 0.96 / (hours until sunset × 0.65)
+      #      (0.96 charge efficiency, 0.65 assumed share of remaining time with
+      #      surplus)                                               → 6/12/18/25
+      #
+      # The emergency stop: the safeguard does NOT write – it only sets the
+      # flag, and the normal control path executes it. There is exactly ONE
+      # write path (the bugs found in reviews all came from several writing
+      # automations coupling their state).
+      #
+      # Constants are kept here on purpose (not as sliders); tune via
+      # template.reload.
+      - name: "Battery Charge Target A"
+        unique_id: battery_charge_target_a
+        unit_of_measurement: "A"
+        state_class: measurement
+        icon: mdi:current-dc
+        availability: >-
+          {{ has_value('sensor.battery_state_of_charge')
+             and has_value('sensor.battery_missing_kwh')
+             and has_value('sensor.pv_remaining_usable')
+             and state_attr('sun.sun', 'next_setting') is not none }}
+        state: >-
+          {% set soc = states('sensor.battery_state_of_charge') | float(0) %}
+          {% set missing = states('sensor.battery_missing_kwh') | float(0) %}
+          {% set usable = states('sensor.pv_remaining_usable') | float(0) %}
+          {% set reserve = states('input_number.min_reserve_soc') | float(25) %}
+          {% set volt = states('input_number.battery_nominal_voltage_v') | float(327) %}
+          {% set dark = is_state('binary_sensor.gfc_dark_day', 'on') %}
+          {# Current stage for the hysteresis rules. this.state is 'unknown'
+             after a template.reload/restart – then fall back to the value last
+             READ BACK from the inverter (charge_control_state.json). That way
+             the hysteresis survives reloads instead of triggering an
+             unnecessary write at the edge. #}
+          {% set stages = ['0','6','12','18','25'] %}
+          {% set current = this.state if this.state in stages
+             else (state_attr('sensor.charge_control_result', 'last_value')
+                   | float(25) | round(0) | int | string) %}
+          {% set was25 = current == '25' %}
+          {% set was0 = current == '0' %}
+          {% if is_state('input_boolean.gfc_emergency_stop', 'on') %}
+            0
+          {% elif not is_state('sun.sun', 'above_horizon') %}
+            25
+          {% elif soc < reserve or is_state('binary_sensor.gfc_reserve_mode', 'on')
+                  or dark or usable <= missing * 1.3 %}
+            25
+          {% elif missing <= (0.55 if was25 else 0.35) %}
+            25
+          {% elif now().hour < 11 and was25 and soc < reserve + 7 %}
+            25
+          {% elif usable >= missing * (2.4 if was0 else 3.0) and now().hour < 11 %}
+            0
+          {% else %}
+            {% set s = as_datetime(state_attr('sun.sun', 'next_setting')) %}
+            {% set rest_h = [(s - now()).total_seconds() / 3600, 0.2] | max %}
+            {% set p_need = missing / 0.96 / (rest_h * 0.65) %}
+            {% if p_need <= (6 * volt / 1000) | round(2) %} 6
+            {% elif p_need <= (12 * volt / 1000) | round(2) %} 12
+            {% elif p_need <= (18 * volt / 1000) | round(2) %} 18
+            {% else %} 25
+            {% endif %}
+          {% endif %}
+
+  - binary_sensor:
+
+      #── Reserve mode ──────────────────────────────────────────────────────────
+      # entity_id: binary_sensor.gfc_reserve_mode
+      # A separate entity instead of an inline comparison, so the hysteresis has
+      # an unambiguous previous state (25 A is set by several rules – the stage
+      # alone cannot tell "am I in reserve mode?").
+      # On below min_reserve_soc, off only 2 points above: in the morning the
+      # SOC oscillates around exactly this mark (charging against house load).
+      - name: "GFC Reserve Mode"
+        unique_id: gfc_reserve_mode
+        icon: mdi:battery-alert-variant-outline
+        availability: "{{ has_value('sensor.battery_state_of_charge') }}"
+        state: >-
+          {% set soc = states('sensor.battery_state_of_charge') | float(0) %}
+          {% set reserve = states('input_number.min_reserve_soc') | float(25) %}
+          {% set was_on = this.state | default('off') == 'on' %}
+          {{ soc < (reserve + 2 if was_on else reserve) }}
+
+      #── Dark day ──────────────────────────────────────────────────────────────
+      # entity_id: binary_sensor.gfc_dark_day
+      # Detected from MEASUREMENT, not forecast: sun up AND time ≥ 10:30 AND
+      # rolling 3 h surplus maximum < dark_day_surplus_w → charge without limit.
+      # Forecast day totals turned out not to discriminate dark days, and an
+      # intraday actual/forecast ratio fails on day-shape errors.
+      # Hysteresis: on below the threshold, off only 20 % above it (without it
+      # the detector flipped twice on a day with passing clouds).
+      # Grace period until 10:30: a slow start is not yet a dark day.
+      # Fail-safe: statistics unavailable → float(99999) → no dark day.
+      # Known weakness: a single short sunny burst lifts the 3 h maximum and
+      # suppresses detection on a bursty cloudy day.
+      - name: "GFC Dark Day"
+        unique_id: gfc_dark_day
+        icon: mdi:weather-cloudy
+        availability: "{{ has_value('sensor.pv_surplus_max_3h') }}"
+        state: >-
+          {% set max3h = states('sensor.pv_surplus_max_3h') | float(99999) %}
+          {% set threshold = states('input_number.dark_day_surplus_w') | float(2500) %}
+          {% set was_on = this.state | default('off') == 'on' %}
+          {{ is_state('sun.sun', 'above_horizon')
+             and (now().hour > 10 or (now().hour == 10 and now().minute >= 30))
+             and max3h < (threshold * 1.2 if was_on else threshold) }}
+
+      #── Grid import while charging (trigger of the safeguard) ─────────────────
+      # entity_id: binary_sensor.gfc_grid_import_while_charging
+      # delay_on 4 min = required minimum duration (filters the 30–60 s
+      # transients measured on the reference system). A STATE rather than a
+      # trigger edge, so the safeguard can fire repeatedly while the condition
+      # persists (a template trigger that is already true never fires again).
+      # float(0) defaults: unavailable -> false -> no false alarm.
+      - name: "GFC Grid Import While Charging"
+        unique_id: gfc_grid_import_while_charging
+        device_class: problem
+        icon: mdi:transmission-tower-import
+        delay_on: "00:04:00"
+        state: >-
+          {{ states('sensor.meter_active_power_total') | float(0) < -300
+             and states('sensor.battery_power') | float(0) < -200 }}
