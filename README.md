@@ -19,11 +19,21 @@ GoodWe was not among them in their overview.
 ## How it works
 
 ```
- Solcast ──┐                      (fallback)
-           ├─► rest forecast ──► usable energy ──► target stage ──► charge_control.py ──► inverter
- Forecast.Solar ┘   (kWh today)     (minus expected     0/6/12/18/25 A   (write only on change,   battery_charge_current
-                                     house load)                          read-back, budget)       via UDP :8899
-                     measurements: SOC, PV, load, grid ──► reserve / dark day / safeguard
+Solcast (live) -------------+
+                            +--> PV forecast, rest of today (kWh)
+Forecast.Solar (fallback) --+    |
+                                 v
+                                 usable energy = forecast - expected house load
+                                 |
+                                 v
+SOC, PV, load, grid -----------> target stage  0 / 6 / 12 / 18 / 25 A
+(reserve, dark day, safeguard)   |
+                                 v
+                                 charge_control.py
+                                 write only on change, read-back, daily budget
+                                 |
+                                 v  local UDP, port 8899
+                                 inverter setting battery_charge_current
 ```
 
 * The only lever is the inverter setting **`battery_charge_current`** (A),

@@ -25,13 +25,13 @@ does exactly that:
 ## Decision chain (gfc_forecast.yaml, gfc_logic.yaml)
 
 ```
-forecast (Solcast live | Forecast.Solar × factor)      sensor.pv_remaining_corrected
-  − mean daylight house load (7 d) × hours to sunset   sensor.pv_remaining_usable
-missing energy to 100 %                                sensor.battery_missing_kwh
-measurements: SOC, 3 h surplus max, grid/battery power  reserve mode / dark day / safeguard
-                         │
-                         ▼
-               sensor.battery_charge_target_a  ∈ {0, 6, 12, 18, 25}
+forecast: Solcast live, or Forecast.Solar x factor    sensor.pv_remaining_corrected
+  - mean daylight house load (7 d) x hours to sunset  sensor.pv_remaining_usable
+missing energy to 100 %                               sensor.battery_missing_kwh
+SOC, 3 h surplus max, grid and battery power          reserve mode, dark day, safeguard
+                          |
+                          v
+          sensor.battery_charge_target_a, one of 0 / 6 / 12 / 18 / 25 A
 ```
 
 Rule order of the target stage (first match wins):
